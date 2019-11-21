@@ -22,7 +22,9 @@
 #include <netdb.h>
 #include <sys/time.h>
 #include <sys/resource.h>
-
+#include <chrono>
+#include <sys/time.h>
+#include <ctime>
 
 using namespace std;
 
@@ -31,15 +33,17 @@ const int BUFFER_SIZE = 2000;
 
 mutex m;
 mutex m_print;
-condition_variable producer_cv, consumer_cv;
 
-
+bool is_qq_empty = true;
 
 struct ReceiveBufferArray {
 	uint8_t buf[ETH_DATA_LEN];
+	int id;
+	time_t time;
 };
 vector<int> packetSize;
 vector<int> consume_buffer;
+vector<std::time_t> time_buffer;
 std::queue<ReceiveBufferArray> qq;
 int gmSocket;
 
@@ -48,57 +52,47 @@ struct sockaddr_in gmServerAddr;
 
 socklen_t gmClientLen = sizeof(gmServerAddr);
 
-
-struct sockaddr_in source_socket_address, dest_socket_address;
-
-
-
 int openSocket(const std::string &IpAddress, int Port)
 {
 
-    int ret;
-    struct timeval timeout;
-    int optval = 1;
+	int ret;
+	struct timeval timeout;
+	int optval = 1;
 
+	gmSocket = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+	if (gmSocket < 0)
+	{
+		std::cout << "cannot Open datagram socket!! Ip: " << IpAddress << " - Port " << std::to_string(Port) << std::endl;
 
+		return -1;
+	}
+	/* Bind our local address so that the client can send to us */
+	gmServerAddr.sin_family = AF_INET;
+	gmServerAddr.sin_addr.s_addr =INADDR_ANY;
+	gmServerAddr.sin_port = htons(Port);
 
-    //gmSocket = socket(AF_INET, SOCK_DGRAM, 0);
-    gmSocket = socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
-    if (gmSocket < 0)
-    {
-        std::cout << "cannot Open datagram socket!! Ip: " << IpAddress << " - Port " << std::to_string(Port) << std::endl;
-
-        return -1;
-    }
-
-
-    /* Bind our local address so that the client can send to us */
-    gmServerAddr.sin_family = AF_INET;
-    gmServerAddr.sin_addr.s_addr =INADDR_ANY;
-    gmServerAddr.sin_port = htons(Port);
-
-
-
-
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
-    setsockopt(gmSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-    setsockopt(gmSocket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
-    setsockopt(gmSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-
-
-
-    std::cout << "Socket has been opened. Ip: " << IpAddress << " - Port " << std::to_string(Port) << std::endl;
-
-
-
-    return 0;
-
-
+	timeout.tv_sec = 3;
+	timeout.tv_usec = 0;
+	setsockopt(gmSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+	setsockopt(gmSocket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+	setsockopt(gmSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+	std::cout << "Socket has been opened. Ip: " << IpAddress << " - Port " << std::to_string(Port) << std::endl;
+	return 0;
 }
 
+
+void sleep_nanoseconds(long sec, long nanosec)
+{
+	struct timespec ts;
+	ts.tv_sec  = sec;
+	ts.tv_nsec = nanosec;
+
+	if(nanosleep(&ts, NULL) == -1)
+	{
+		perror("nanosleep");
+		exit(EXIT_FAILURE);
+	}
+}
 
 
 void print_thread(){
@@ -116,7 +110,7 @@ void consumer_thread()
 	int new_id = 0;
 	int last_id = 0;
 	int packet_counter = 0;
-
+	struct sockaddr_in source_socket_address, dest_socket_address;
 	memset(&source_socket_address, 0, sizeof(source_socket_address));
 	memset(&dest_socket_address, 0, sizeof(dest_socket_address));
 	uint8_t ethernet_data[ETH_DATA_LEN];
@@ -142,31 +136,31 @@ void consumer_thread()
 
 			if(ip_packet->saddr == inet_addr("192.168.2.20"))
 			{
-				std::cout << "id: " << std::to_string(ntohs(ip_packet->id)) << ", Packet Number: " << std::to_string(packet_counter) <<endl;
-				printf("%2X-%2X\n",ethernet_data[4],ethernet_data[5]);
+				consume_buffer.push_back(ntohs(ip_packet->id));
+				std::cout << "id: " << std::to_string(ntohs(ip_packet->id)) << ", Packet Number: " << std::to_string(consume_buffer.size()) <<endl;
 				packet_counter++;
 			}
+			usleep(1);
 
+		}else if(qq.empty() && is_qq_empty){
+		//	m_print.lock();
+			if(consume_buffer.size()>0)
+				consume_buffer.clear();
+			//m_print.unlock();
 
+			usleep(1);
+			//******************* U N L O C K***************************************************************
 
-
-			usleep(100);
 
 		}
-
-		usleep(1000);
-		//******************* U N L O C K***************************************************************
-
-
 	}
 }
-
 void producer_thread()
 {
 	int packet_size;
 
-   openSocket("192.168.2.20",5001);
-   ReceiveBufferArray _rbuf;
+	openSocket("192.168.2.20",5001);
+	ReceiveBufferArray _rbuf;
 
 	while (true)
 	{
@@ -176,9 +170,15 @@ void producer_thread()
 
 		if (packet_size > 0)
 		{
+			is_qq_empty = false;
 			m.lock();//##################################################3
 			qq.push(_rbuf);
 			m.unlock();//##################################################3
+		}else if (packet_size < 0){
+			is_qq_empty = true;
+			//packet_counter = 0;
+
+			//cout << "###packet_counter=" << packet_counter << endl;
 		}
 	}
 }
@@ -190,7 +190,7 @@ int main()
 
 	//thread print
 
-    setpriority(PRIO_PROCESS, 0, -20);
+	setpriority(PRIO_PROCESS, 0, -20);
 	thread cons(consumer_thread);
 	thread prod(producer_thread);
 	cons.join();
