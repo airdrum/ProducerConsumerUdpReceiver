@@ -25,7 +25,7 @@
 #include <chrono>
 #include <sys/time.h>
 #include <ctime>
-
+#include <numeric>
 using namespace std;
 
 const int BUFFER_SIZE = 2000;
@@ -43,6 +43,7 @@ struct ReceiveBufferArray {
 };
 vector<int> packetSize;
 vector<int> consume_buffer;
+vector<int> loss_buffer;
 vector<std::time_t> time_buffer;
 std::queue<ReceiveBufferArray> qq;
 int gmSocket;
@@ -105,6 +106,29 @@ void print_thread(){
 	}
 }
 
+void loss_calculator(vector<int> &vec, int old_val, int new_val){
+	// only the old val will be added as number zero : successful packet. the new val will be handled in the next loops
+	// after this function; do: -> old_val = new_val;
+	int numel = new_val - old_val;
+	vec.push_back(1);// to comply the first old_val packet as 1
+	if (numel==1)
+		vec.push_back(numel);
+	else if(numel > 0)
+		for(int j=1;j<numel;j++)
+			vec.push_back(0);
+	else if(numel<0){
+		for(int j=old_val;j<65535;j++)
+			vec.push_back(0);
+		for(int j=1;j<new_val;j++)
+			vec.push_back(0);
+	}
+
+	if(new_val==1){
+		vec.push_back(1);//the packet identification number 1
+	}
+
+}
+
 void consumer_thread()
 {
 	int new_id = 0;
@@ -115,7 +139,7 @@ void consumer_thread()
 	memset(&dest_socket_address, 0, sizeof(dest_socket_address));
 	uint8_t ethernet_data[ETH_DATA_LEN];
 
-
+	int old_val;
 
 	while (true)
 	{
@@ -137,6 +161,8 @@ void consumer_thread()
 			if(ip_packet->saddr == inet_addr("192.168.2.20"))
 			{
 				consume_buffer.push_back(ntohs(ip_packet->id));
+				loss_calculator(loss_buffer, old_val, ntohs(ip_packet->id));
+				old_val = ntohs(ip_packet->id);
 				std::cout << "id: " << std::to_string(ntohs(ip_packet->id)) << ", Packet Number: " << std::to_string(consume_buffer.size()) <<endl;
 				packet_counter++;
 			}
@@ -147,7 +173,7 @@ void consumer_thread()
 			if(consume_buffer.size()>0)
 				consume_buffer.clear();
 			//m_print.unlock();
-
+			//cout << accumulate(loss_buffer.begin(),loss_buffer.end(),0) <<endl; // ???????
 			usleep(1);
 			//******************* U N L O C K***************************************************************
 
@@ -189,7 +215,13 @@ int main()
 {
 
 	//thread print
-
+	/* LOSS calculation
+	loss_calculator(loss_buffer, 20, 24);
+	loss_calculator(loss_buffer, 65530, 1);
+	loss_calculator(loss_buffer, 1, 18);
+	for (int i =0;i<loss_buffer.size();i++)
+		printf("%d,",loss_buffer.at(i));
+	*/
 	setpriority(PRIO_PROCESS, 0, -20);
 	thread cons(consumer_thread);
 	thread prod(producer_thread);
