@@ -31,11 +31,12 @@ using namespace std;
 const int BUFFER_SIZE = 2000;
 #define ETH_DATA_LEN 1512
 #define UDP 0x11
-#define SRC_ADDR "192.168.2.20"
+#define SRC_ADDR "192.168.56.20"
 mutex m;
 mutex m_print;
 
-bool is_qq_empty = true;
+bool is_producer_empty = true;
+bool is_consumer_empty = true;
 
 struct ReceiveBufferArray {
 	uint8_t buf[ETH_DATA_LEN];
@@ -47,6 +48,8 @@ vector<int> packetSize;
 vector<int> consume_buffer;
 vector<int> loss_buffer;
 vector<std::time_t> time_buffer;
+
+int counter = 0;
 std::queue<ReceiveBufferArray> qq;
 std::queue<ReceiveBufferArray> qq_copy;
 int gmSocket;
@@ -91,7 +94,7 @@ int openSocket(const std::string &IpAddress, int Port)
 	gmServerAddr.sin_addr.s_addr =INADDR_ANY;
 	gmServerAddr.sin_port = htons(Port);
 
-	timeout.tv_sec = 3;
+	timeout.tv_sec = 1;
 	timeout.tv_usec = 0;
 	setsockopt(gmSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 	setsockopt(gmSocket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
@@ -100,6 +103,17 @@ int openSocket(const std::string &IpAddress, int Port)
 	return 0;
 }
 
+std::queue<ReceiveBufferArray> copy_queue(const std::queue<ReceiveBufferArray> &Q) {
+	// ^^^^^
+	std::queue<ReceiveBufferArray>Q2 = Q;
+	return Q2;
+}
+
+void clear_queue( std::queue<ReceiveBufferArray> &q )
+{
+	std::queue<ReceiveBufferArray> empty;
+	std::swap( q, empty );
+}
 
 void sleep_nanoseconds(long sec, long nanosec)
 {
@@ -111,17 +125,6 @@ void sleep_nanoseconds(long sec, long nanosec)
 	{
 		perror("nanosleep");
 		exit(EXIT_FAILURE);
-	}
-}
-
-
-void print_thread(){
-	while(true){
-		m_print.lock();//##################################################3
-		if(!consume_buffer.empty())
-			printf("%d\n",consume_buffer.size());
-		m_print.unlock();//##################################################3
-		usleep(1000 * 1000);
 	}
 }
 
@@ -151,8 +154,6 @@ void loss_calculator(vector<int> &vec, int old_val, int new_val){
 
 void consumer_thread()
 {
-	int new_id = 0;
-	int last_id = 0;
 	int packet_counter = 0;
 	struct sockaddr_in source_socket_address, dest_socket_address;
 	memset(&source_socket_address, 0, sizeof(source_socket_address));
@@ -162,26 +163,13 @@ void consumer_thread()
 	int old_val = 99999;
 	while (true)
 	{
-		//m.lock();//******************* L O C K***************************************************************
-		//##################################################
 		if (!qq.empty())
 		{
-			// Record start time
-			auto start = std::chrono::high_resolution_clock::now();
-
 			m.lock();
-
 			std::copy(std::begin(qq.front().buf),std::end(qq.front().buf), std::begin(ethernet_data));
 			qq.pop();
-
 			m.unlock();
 
-			// Record end time
-			auto finish = std::chrono::high_resolution_clock::now();
-			std::chrono::duration<double> elapsed = finish - start;
-			//std::cout << "Elapsed time: " << elapsed.count() << " s -- ";
-			//cout << getCurrentTimeStamp() << "-POP"<<endl;
-			//##################################################
 			struct iphdr *ip_packet = (struct iphdr *)ethernet_data;
 
 			if((ip_packet->saddr == inet_addr(SRC_ADDR)) && (ip_packet->protocol == UDP))
@@ -193,31 +181,24 @@ void consumer_thread()
 					loss_calculator(loss_buffer, old_val, ntohs(ip_packet->id));
 				old_val = ntohs(ip_packet->id);
 
-				std::cout << "id: " << std::to_string(ntohs(ip_packet->id))
-				<< ", Packet Number: " << std::to_string(consume_buffer.size())
-				<< ", LossBuffer size: " << std::to_string(loss_buffer.size())<<endl;
-
 				packet_counter++;
+				std::cout << "id: " << std::to_string(ntohs(ip_packet->id))
+				<< ", PN: " << std::to_string(consume_buffer.size())
+				<< ", LBsize: " << std::to_string(loss_buffer.size())
+				<< "PCnt: " <<packet_counter
+				<<endl;
+
 			}
 			sleep_nanoseconds(0,1);
 
-		}else if(qq.empty() && is_qq_empty){
+		}else if(qq.empty() && is_producer_empty){
 			m_print.lock();
-			if(consume_buffer.size()>0)
+			if(consume_buffer.size()>0){
+				std::cout << "The loss rate is : " <<to_string((double)(loss_buffer.size() - consume_buffer.size())/loss_buffer.size()) << endl;
 				consume_buffer.clear();
-			m_print.unlock();
-			old_val = 0;
-			int x = 0;
-			if(old_val==0){
-				for (int i =0;i<loss_buffer.size();i++)
-					x +=loss_buffer.at(i);
-				std::cout << "Loss is:"<< x<< ",Size:" << loss_buffer.size() << endl;
-				old_val = 99999;
+				loss_buffer.clear();
 			}
-
-			//******************* U N L O C K***************************************************************
-
-
+			m_print.unlock();
 		}
 		sleep_nanoseconds(0,1);
 	}
@@ -231,30 +212,17 @@ void producer_thread()
 
 	while (true)
 	{
-
-
 		packet_size = recvfrom(gmSocket , _rbuf.buf , ETH_DATA_LEN , 0 , NULL, NULL);
 
 		if (packet_size > 0)
 		{
-			is_qq_empty = false;
-			auto start = std::chrono::high_resolution_clock::now();
+			is_producer_empty = false;
 			m.lock();//##################################################3
 			qq.push(_rbuf);
-
-
 			m.unlock();//##################################################3
 
-			// Record end time
-			auto finish = std::chrono::high_resolution_clock::now();
-			std::chrono::duration<double> elapsed = finish - start;
-			//std::cout << "Elapsed time: " << elapsed.count() << " s -- ";
-			//cout << getCurrentTimeStamp() << "-PUSH"<<endl;
 		}else if (packet_size < 0){
-			is_qq_empty = true;
-			//packet_counter = 0;
-
-			//cout << "###packet_counter=" << packet_counter << endl;
+			is_producer_empty = true;
 		}
 	}
 }
@@ -263,25 +231,15 @@ void producer_thread()
 
 int main()
 {
-
-	//thread print
-	/* LOSS calculation
-	loss_calculator(loss_buffer, 20, 24);
-	loss_calculator(loss_buffer, 65530, 1);
-	loss_calculator(loss_buffer, 1, 18);
-	for (int i =0;i<loss_buffer.size();i++)
-		printf("%d,",loss_buffer.at(i));
-	*/
 	setpriority(PRIO_PROCESS, 0, -20);
 	thread cons(consumer_thread);
 	thread prod(producer_thread);
 	//thread printer(print_thread);
-	cons.join();
-	prod.join();
-	//printer.join();
-	while(1);
-	//producer_thread();
 
-	system("pause");
+	prod.join();
+	cons.join();
+	//printer.join();
+	//while(1);
+	//producer_thread();
 	return 0;
 }
