@@ -37,6 +37,7 @@ mutex m_print;
 
 bool is_producer_empty = true;
 bool is_consumer_empty = true;
+bool is_consume_buffer = false;
 
 struct ReceiveBufferArray {
 	uint8_t buf[ETH_DATA_LEN];
@@ -165,6 +166,7 @@ void consumer_thread()
 	{
 		if (!qq.empty())
 		{
+			is_consume_buffer = true;
 			m.lock();
 			std::copy(std::begin(qq.front().buf),std::end(qq.front().buf), std::begin(ethernet_data));
 			qq.pop();
@@ -174,20 +176,14 @@ void consumer_thread()
 
 			if((ip_packet->saddr == inet_addr(SRC_ADDR)) && (ip_packet->protocol == UDP))
 			{
+				m_print.lock();
 				consume_buffer.push_back(ntohs(ip_packet->id));
 				if(old_val==99999)
 					loss_calculator(loss_buffer, old_val, 100000);// for the first packet
 				else
 					loss_calculator(loss_buffer, old_val, ntohs(ip_packet->id));
 				old_val = ntohs(ip_packet->id);
-
-				packet_counter++;
-				std::cout << "id: " << std::to_string(ntohs(ip_packet->id))
-				<< ", PN: " << std::to_string(consume_buffer.size())
-				<< ", LBsize: " << std::to_string(loss_buffer.size())
-				<< "PCnt: " <<packet_counter
-				<<endl;
-
+				m_print.unlock();
 			}
 			sleep_nanoseconds(0,1);
 
@@ -197,10 +193,12 @@ void consumer_thread()
 				std::cout << "The loss rate is : " <<to_string((double)(loss_buffer.size() - consume_buffer.size())/loss_buffer.size()) << endl;
 				consume_buffer.clear();
 				loss_buffer.clear();
+
 			}
 			m_print.unlock();
 		}
 		sleep_nanoseconds(0,1);
+		is_consume_buffer = false;
 	}
 }
 void producer_thread()
@@ -228,17 +226,49 @@ void producer_thread()
 }
 
 
+void printer_thread()
+{
+	int new_val_consume_buffer = 0;
+	int loss_buffer_size = 0;
+	int old_val_consume_buffer = 0;
+	int counter = 0;
+	while(true){
+		if(is_consume_buffer){
+
+			m_print.lock();
+			new_val_consume_buffer = consume_buffer.size();
+			loss_buffer_size = loss_buffer.size();
+			m_print.unlock();
+			if(!(new_val_consume_buffer==0)){
+				std::cout << counter<< "sec - capturedPacket: "
+										<< (new_val_consume_buffer - old_val_consume_buffer)
+									  << ", speed:"
+									  	  << std::to_string((double)(ETH_DATA_LEN * (new_val_consume_buffer-old_val_consume_buffer)*8.0/1024.0/1024.0))
+									  << " Mbits/sec, Loss number: "
+									  	  << std::to_string(loss_buffer_size - new_val_consume_buffer)
+									  <<endl;
+							old_val_consume_buffer = new_val_consume_buffer;
+			}
+
+			counter++;
+			sleep(1);
+		}
+	}
+
+
+}
+
 
 int main()
 {
 	setpriority(PRIO_PROCESS, 0, -20);
 	thread cons(consumer_thread);
 	thread prod(producer_thread);
-	//thread printer(print_thread);
+	thread printer(printer_thread);
 
 	prod.join();
 	cons.join();
-	//printer.join();
+	printer.join();
 	//while(1);
 	//producer_thread();
 	return 0;
