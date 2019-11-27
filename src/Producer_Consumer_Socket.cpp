@@ -26,6 +26,8 @@
 #include <sys/time.h>
 #include <ctime>
 #include <numeric>
+#include <algorithm>
+#include <boost/crc.hpp>
 using namespace std;
 
 const int BUFFER_SIZE = 2000;
@@ -39,17 +41,23 @@ bool is_producer_empty = true;
 bool is_consumer_empty = true;
 bool is_consume_buffer = false;
 
+
+
+
+
 struct ReceiveBufferArray {
 	uint8_t buf[ETH_DATA_LEN];
 	int id;
+	uint32_t crc;
 	time_t time;
 	int index;
 };
 vector<int> packetSize;
 vector<int> consume_buffer;
 vector<int> loss_buffer;
+vector<int> crc_buffer;
 vector<std::time_t> time_buffer;
-
+boost::crc_32_type  crc;
 int counter = 0;
 std::queue<ReceiveBufferArray> qq;
 std::queue<ReceiveBufferArray> qq_copy;
@@ -159,8 +167,8 @@ void consumer_thread()
 	struct sockaddr_in source_socket_address, dest_socket_address;
 	memset(&source_socket_address, 0, sizeof(source_socket_address));
 	memset(&dest_socket_address, 0, sizeof(dest_socket_address));
-	uint8_t ethernet_data[ETH_DATA_LEN];
 
+	uint8_t ethernet_data[ETH_DATA_LEN];
 	int old_val = 99999;
 	while (true)
 	{
@@ -169,11 +177,15 @@ void consumer_thread()
 			is_consume_buffer = true;
 			m.lock();
 			std::copy(std::begin(qq.front().buf),std::end(qq.front().buf), std::begin(ethernet_data));
+			uint32_t crc_val = qq.front().crc;
 			qq.pop();
 			m.unlock();
 
 			struct iphdr *ip_packet = (struct iphdr *)ethernet_data;
 
+
+
+			// get packets coming from SRC_ADDR and UDP protocol
 			if((ip_packet->saddr == inet_addr(SRC_ADDR)) && (ip_packet->protocol == UDP))
 			{
 				m_print.lock();
@@ -211,6 +223,9 @@ void producer_thread()
 	while (true)
 	{
 		packet_size = recvfrom(gmSocket , _rbuf.buf , ETH_DATA_LEN , 0 , NULL, NULL);
+		// ADD CRC32 to ethernet data
+		crc.process_bytes( _rbuf.buf, ETH_DATA_LEN );
+		_rbuf.crc = crc.checksum();
 
 		if (packet_size > 0)
 		{
@@ -241,13 +256,13 @@ void printer_thread()
 			m_print.unlock();
 			if(!(new_val_consume_buffer==0)){
 				std::cout << counter<< "sec - capturedPacket: "
-										<< (new_val_consume_buffer - old_val_consume_buffer)
-									  << ", speed:"
-									  	  << std::to_string((double)(ETH_DATA_LEN * (new_val_consume_buffer-old_val_consume_buffer)*8.0/1024.0/1024.0))
-									  << " Mbits/sec, Loss number: "
-									  	  << std::to_string(loss_buffer_size - new_val_consume_buffer)
-									  <<endl;
-							old_val_consume_buffer = new_val_consume_buffer;
+						<< (new_val_consume_buffer - old_val_consume_buffer)
+						<< ", speed:"
+						<< std::to_string((double)(ETH_DATA_LEN * (new_val_consume_buffer-old_val_consume_buffer)*8.0/1024.0/1024.0))
+				<< " Mbits/sec, Loss number: "
+				<< std::to_string(loss_buffer_size - new_val_consume_buffer)
+				<<endl;
+				old_val_consume_buffer = new_val_consume_buffer;
 			}
 
 			counter++;
@@ -256,8 +271,8 @@ void printer_thread()
 	}
 
 
-}
 
+}
 
 int main()
 {
