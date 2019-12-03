@@ -28,45 +28,72 @@
 #include <numeric>
 #include <algorithm>
 #include <boost/crc.hpp>
+#include <chrono>
+#include <ctime>
+#include <sstream> // stringstream
+#include <iomanip> // put_time
+#include <string>  // string
+#include <arpa/inet.h>
+#include <net/ethernet.h>
+#include <linux/udp.h>
+#include <iostream>
+
+#include <bsoncxx/builder/stream/document.hpp>
+#include <bsoncxx/json.hpp>
+
+#include <mongocxx/client.hpp>
+#include <mongocxx/instance.hpp>
+
 using namespace std;
 
 const int BUFFER_SIZE = 2000;
 #define ETH_DATA_LEN 1512
 #define UDP 0x11
 #define SRC_ADDR "192.168.56.20"
-mutex m;
-mutex m_print;
+
+#define DEBUG_PACKET  	0
+mutex m; 				// LOCK for main_queue_thread
+mutex m_print;			// LOCK for printer_thread
+
+
 
 bool is_producer_empty = true;
 bool is_consumer_empty = true;
 bool is_consume_buffer = false;
+bool is_transmission_finished = false;
+bool print_loss =true;
 
+// Buffer Sizes
+int new_val_consume_buffer = 0;
+int loss_buffer_size = 0;
+int old_val_consume_buffer = 0;
 
-
-
-
+bool print_ok = false; // printing out flag and for exiting the program
 struct ReceiveBufferArray {
 	uint8_t buf[ETH_DATA_LEN];
 	int id;
-	uint32_t crc;
-	time_t time;
-	int index;
+	uint16_t checksum;
+	string time;
 };
+std::queue<ReceiveBufferArray> main_queue_buffer;
+
 vector<int> packetSize;
 vector<int> consume_buffer;
 vector<int> loss_buffer;
 vector<int> crc_buffer;
+
 vector<std::time_t> time_buffer;
+
 boost::crc_32_type  crc;
 int counter = 0;
-std::queue<ReceiveBufferArray> qq;
-std::queue<ReceiveBufferArray> qq_copy;
+int total_packet_count = 0;
 int gmSocket;
 
 struct sockaddr_in gmClientAddr;
 struct sockaddr_in gmServerAddr;
 
 socklen_t gmClientLen = sizeof(gmServerAddr);
+
 std::string getCurrentTimeStamp(){
 	using std::chrono::system_clock;
 	auto currentTime = std::chrono::system_clock::now();
@@ -84,6 +111,7 @@ std::string getCurrentTimeStamp(){
 	sprintf(buffer,"%s:%03d",buffer,(int)millis);
 	return std::string(buffer);
 }
+
 int openSocket(const std::string &IpAddress, int Port)
 {
 
@@ -112,16 +140,15 @@ int openSocket(const std::string &IpAddress, int Port)
 	return 0;
 }
 
-std::queue<ReceiveBufferArray> copy_queue(const std::queue<ReceiveBufferArray> &Q) {
-	// ^^^^^
-	std::queue<ReceiveBufferArray>Q2 = Q;
-	return Q2;
-}
 
-void clear_queue( std::queue<ReceiveBufferArray> &q )
+std::string return_current_time_and_date()
 {
-	std::queue<ReceiveBufferArray> empty;
-	std::swap( q, empty );
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %X");
+    return ss.str();
 }
 
 void sleep_nanoseconds(long sec, long nanosec)
@@ -170,44 +197,85 @@ void consumer_thread()
 
 	uint8_t ethernet_data[ETH_DATA_LEN];
 	int old_val = 99999;
-	while (true)
+	while (!is_transmission_finished)
 	{
-		if (!qq.empty())
+		if (!main_queue_buffer.empty())
 		{
 			is_consume_buffer = true;
+
+			// LOCK main_queue_buffer producer THREAD
 			m.lock();
-			std::copy(std::begin(qq.front().buf),std::end(qq.front().buf), std::begin(ethernet_data));
-			uint32_t crc_val = qq.front().crc;
-			qq.pop();
+
+			std::copy(std::begin(main_queue_buffer.front().buf),std::end(main_queue_buffer.front().buf), std::begin(ethernet_data));
+			uint16_t check_val = main_queue_buffer.front().checksum;
+			main_queue_buffer.pop();
+
+			// UNLOCK main_queue_buffer producer THREAD
 			m.unlock();
-
 			struct iphdr *ip_packet = (struct iphdr *)ethernet_data;
+			if( DEBUG_PACKET)
+			{
+				
+				//unsigned char * data = (ethernet_data + iphdrlen + sizeof(struct ethhdr) + sizeof(struct udphdr));
 
+				struct ethhdr *eth = (struct ethhdr *)(ethernet_data);
+				unsigned short iphdrlen;
+				struct iphdr *ip = (struct iphdr *)( ethernet_data + sizeof(struct ethhdr) );
+				/* getting actual size of IP header*/
+				iphdrlen = ip->ihl*4;
+				/* getting pointer to udp header*/
+				struct udphdr *udp=(struct udphdr*)(ethernet_data + iphdrlen + sizeof(struct ethhdr));
+				unsigned char *data = (ethernet_data + iphdrlen + sizeof(struct ethhdr) + sizeof(struct udphdr));
+				int remaining_data = ETH_DATA_LEN - (iphdrlen + sizeof(struct ethhdr) + sizeof(struct udphdr));
+	
+				for(int i=0;i<remaining_data;i++)
+				{
+					
+						printf("%.2X ",data[i]);
+						
+				}
+				cout << endl;
+				cout << endl;
 
-
+			}
 			// get packets coming from SRC_ADDR and UDP protocol
 			if((ip_packet->saddr == inet_addr(SRC_ADDR)) && (ip_packet->protocol == UDP))
 			{
+				// LOCK PRINTER THREAD
 				m_print.lock();
+
 				consume_buffer.push_back(ntohs(ip_packet->id));
-				if(old_val==99999)
-					loss_calculator(loss_buffer, old_val, 100000);// for the first packet
+				if(old_val>65535)
+					loss_calculator(loss_buffer, old_val, old_val+1);// for the first packet
 				else
 					loss_calculator(loss_buffer, old_val, ntohs(ip_packet->id));
 				old_val = ntohs(ip_packet->id);
+
+				// UNLOCK PRINTER THREAD
 				m_print.unlock();
 			}
 			sleep_nanoseconds(0,1);
 
-		}else if(qq.empty() && is_producer_empty){
+		}else if(main_queue_buffer.empty() && is_producer_empty && print_ok){
+			// LOCK PRINTER THREAD
 			m_print.lock();
-			if(consume_buffer.size()>0){
-				std::cout << "The loss rate is : " <<to_string((double)(loss_buffer.size() - consume_buffer.size())/loss_buffer.size()) << endl;
-				consume_buffer.clear();
-				loss_buffer.clear();
+			// Check if consume_buffer is empty
+			if(consume_buffer.size()==0 && print_loss){ 
+				// Print the final loss rate statistics
+				
+				std::cout <<"Total Packet: "<< total_packet_count
+						 << ", The loss rate is : " 
+						  << to_string((double)(loss_buffer_size - new_val_consume_buffer)/loss_buffer_size) 
+						  << endl;
+				print_loss = false;
+				new_val_consume_buffer = 0;
+				old_val_consume_buffer = 0;
+				total_packet_count = 0;
 
 			}
+			// UNLOCK PRINTER THREAD
 			m_print.unlock();
+			//exit(0);
 		}
 		sleep_nanoseconds(0,1);
 		is_consume_buffer = false;
@@ -220,19 +288,25 @@ void producer_thread()
 	openSocket(SRC_ADDR,5001);
 	ReceiveBufferArray _rbuf;
 
-	while (true)
+	while (!is_transmission_finished)
 	{
 		packet_size = recvfrom(gmSocket , _rbuf.buf , ETH_DATA_LEN , 0 , NULL, NULL);
 		// ADD CRC32 to ethernet data
-		crc.process_bytes( _rbuf.buf, ETH_DATA_LEN );
-		_rbuf.crc = crc.checksum();
+		//_rbuf.checksum = checksum(_rbuf.buf,ETH_DATA_LEN);
+
+		_rbuf.time = getCurrentTimeStamp();
 
 		if (packet_size > 0)
 		{
 			is_producer_empty = false;
-			m.lock();//##################################################3
-			qq.push(_rbuf);
-			m.unlock();//##################################################3
+			// LOCK MAIN QUEUE THREAD
+			m.lock();
+
+			// Push ReceiverBuffer struct into --> main_queue_buffer
+			main_queue_buffer.push(_rbuf);
+
+			// UNLOCK MAIN QUEUE THREAD
+			m.unlock();
 
 		}else if (packet_size < 0){
 			is_producer_empty = true;
@@ -243,30 +317,80 @@ void producer_thread()
 
 void printer_thread()
 {
-	int new_val_consume_buffer = 0;
-	int loss_buffer_size = 0;
-	int old_val_consume_buffer = 0;
-	int counter = 0;
-	while(true){
+	
+// MONGODB database global variables-----------
+mongocxx::instance inst{};
+mongocxx::client conn{mongocxx::uri("mongodb://localhost:27017")};
+
+bsoncxx::builder::stream::document document{};
+
+auto collection = conn["testdb"]["testcollection"];
+// MONGODB database global variables------------
+
+	
+	while(!is_transmission_finished){
 		if(is_consume_buffer){
 
+			// LOCK PRINTER THREAD
 			m_print.lock();
+			
 			new_val_consume_buffer = consume_buffer.size();
 			loss_buffer_size = loss_buffer.size();
+
+			// UNLOCK PRINTER THREAD
 			m_print.unlock();
-			if(!(new_val_consume_buffer==0)){
-				std::cout << counter<< "sec - capturedPacket: "
-						<< (new_val_consume_buffer - old_val_consume_buffer)
-						<< ", speed:"
-						<< std::to_string((double)(ETH_DATA_LEN * (new_val_consume_buffer-old_val_consume_buffer)*8.0/1024.0/1024.0))
-				<< " Mbits/sec, Loss number: "
-				<< std::to_string(loss_buffer_size - new_val_consume_buffer)
-				<<endl;
+
+			// Check if new_val_consume_buffer is still not 0 (meaning consume_buffer.size() gives something)
+			// Then printout what is received.
+			if(!(new_val_consume_buffer == 0)){
+				
+				//Enable print_ok flag for exiting the program
+				print_ok = true;
+				print_loss =true;
+				// Printout the received UDP DATA statistics.
+				if(counter >= 0){
+
+					
+
+					collection.insert_one(document.view());
+
+					total_packet_count = total_packet_count + (new_val_consume_buffer - old_val_consume_buffer);
+					document.clear();
+					document << "time" << return_current_time_and_date();
+					document << "datarate" << std::to_string((double)(ETH_DATA_LEN * (new_val_consume_buffer-old_val_consume_buffer)*8.0/1024.0/1024.0));
+					document << "totalpacket" << total_packet_count;
+					std::cout   << "Time: " << return_current_time_and_date()
+								<<"," << counter<< " sec - capturedPacket: "
+								<< (new_val_consume_buffer - old_val_consume_buffer)
+								<< ", speed:"
+								<< std::to_string((double)(ETH_DATA_LEN * (new_val_consume_buffer-old_val_consume_buffer)*8.0/1024.0/1024.0))
+								<< " Mbits/sec, Loss number: "
+								<< std::to_string(loss_buffer_size - new_val_consume_buffer)
+								<< endl;
+				}
+				
+				// There will be a portion to push this UDP data statistics into nosql database server.
+				// ...... 
+				// /////////////////////////////////////////////////////////////////////////////
+
+				// make new_val_consume_buffer as the old_val_consume_buffer for next packet number calculation statistics
 				old_val_consume_buffer = new_val_consume_buffer;
 			}
-
+			
 			counter++;
 			sleep(1);
+		}else if (is_producer_empty){
+
+			m_print.lock();
+			
+			// Clear consume_buffer
+			consume_buffer.clear();
+			// Clear loss_buffer
+			loss_buffer.clear();
+
+			// UNLOCK PRINTER THREAD
+			m_print.unlock();
+			counter = 0;
 		}
 	}
 
@@ -284,7 +408,5 @@ int main()
 	prod.join();
 	cons.join();
 	printer.join();
-	//while(1);
-	//producer_thread();
 	return 0;
 }
